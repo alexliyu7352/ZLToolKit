@@ -98,18 +98,25 @@ void no_locks_localtime(struct tm *tmp, time_t t) {
      * Take a single snapshot of the offset, so that a concurrent
      * local_time_refresh() cannot make the broken down time and tm_gmtoff
      * disagree with each other. */
+    int daylight_active = get_daylight_active();
     long gmtoff = get_local_gmtoff();
 
     t += gmtoff; /* Adjust for timezone and daylight time. */
     time_t days = t / secs_day; /* Days passed since epoch. */
     time_t seconds = t % secs_day; /* Remaining seconds. */
 
-    tmp->tm_isdst = get_daylight_active();
+    tmp->tm_isdst = daylight_active;
     tmp->tm_hour = seconds / secs_hour;
     tmp->tm_min = (seconds % secs_hour) / secs_min;
     tmp->tm_sec = (seconds % secs_hour) % secs_min;
 #ifndef _WIN32
     tmp->tm_gmtoff = gmtoff;
+    /* tm_zone不填的话就是调用方栈上的未初始化指针，一旦用%Z格式化便会读到非法内存；
+     * tzname由tzset()填充，读取它无需加锁，fork之后同样有效，因此在这里是安全的
+     * Leaving tm_zone alone would keep whatever uninitialized pointer the caller has on its
+     * stack, and formatting with %Z would then read invalid memory; tzname is filled in by
+     * tzset(), reading it needs no lock and stays valid across fork(), so it is safe here */
+    tmp->tm_zone = tzname[daylight_active ? 1 : 0];
 #endif
     /* 1/1/1970 was a Thursday, that is, day 4 from the POV of the tm structure
      * where sunday = 0, so to calculate the day of the week we have to add 4

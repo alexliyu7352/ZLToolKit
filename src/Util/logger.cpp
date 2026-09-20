@@ -496,6 +496,13 @@ static time_t getLogFileTime(const string &full_path) {
     if (!strptime(name, "%Y-%m-%d", &tm)) {
         return 0;
     }
+    //tm_isdst保持0意味着强制按标准时解释该日期，夏令时期间的日志文件会因此偏差一小时，
+    //经getDay()换算后被算作前一天，最终比保留天数提前一天被删除；置-1交由mktime自行判断
+    //Leaving tm_isdst at zero forces the date to be read as standard time, which puts the log
+    //files of the daylight saving period one hour off, makes getDay() attribute them to the
+    //previous day and deletes them one day earlier than the retention setting; -1 lets mktime
+    //work it out on its own
+    tm.tm_isdst = -1;
     //此函数会把本地时间转换成GMT时间戳
     return mktime(&tm);
 }
