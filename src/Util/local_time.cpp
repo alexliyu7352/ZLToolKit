@@ -33,9 +33,6 @@
 
 #include <atomic>
 #include <ctime>
-#ifndef _WIN32
-#include <sys/time.h>
-#endif
 
 #include "local_time.h"
 
@@ -46,15 +43,19 @@
  * in order to log something to the Redis log, it may deadlock: in the copy
  * of the address space of the forked process the lock will never be released.
  *
- * This function takes the timezone 'tz' as argument, and the 'dst' flag is
- * used to check if daylight saving time is currently in effect. The caller
- * of this function should obtain such information calling tzset() ASAP in the
- * main() function to obtain the timezone offset from the 'timezone' global
- * variable. To obtain the daylight information, if it is currently active or not,
- * one trick is to call localtime() in main() ASAP as well, and get the
- * information from the tm_isdst field of the tm structure. However the daylight
- * time may switch in the future for long running processes, so this information
- * should be refreshed at safe times.
+ * 本实现与Redis原版的区别: 偏移量直接取自localtime()填充的tm_gmtoff，而不是
+ * 由'timezone'全局变量加上固定1小时的夏令时修正推算，因此半小时夏令时的地区
+ * (如澳大利亚豪勋爵岛)也能得到正确结果，且不依赖各平台对'timezone'的实现差异。
+ * 该偏移由local_time_refresh()刷新，长时间运行的进程需要定期调用它，
+ * 否则夏令时切换后本地时间会一直偏差。
+ * Unlike the original Redis version, the offset is taken straight from the
+ * tm_gmtoff filled in by localtime(), instead of being derived from the
+ * 'timezone' global plus a hardcoded one hour daylight saving correction. Regions
+ * with a half hour daylight saving time (Lord Howe Island for instance) are
+ * therefore correct as well, and no assumption is made about how each platform
+ * implements 'timezone'. The offset is refreshed by local_time_refresh(), which a
+ * long running process has to call periodically, otherwise the local time would
+ * stay off after a daylight saving time switch.
  *
  * Note that this function does not work for dates < 1/1/1970, it is solely
  * designed to work with what time(NULL) may return, and to support Redis
@@ -63,17 +64,17 @@ namespace toolkit {
 /* 两者都由local_time_refresh()更新、被任意线程读取，故使用原子变量
  * Both are updated by local_time_refresh() and read by any thread, hence atomic. */
 static std::atomic<int> _daylight_active { 0 };
-static std::atomic<long> _current_timezone { 0 };
+/* 本地时间相对UTC的偏移(秒)，取自localtime()的tm_gmtoff，已含夏令时修正
+ * Offset of the local time from UTC in seconds, taken from the tm_gmtoff of
+ * localtime(), daylight saving time included */
+static std::atomic<long> _local_gmtoff { 0 };
 
 int get_daylight_active() {
     return _daylight_active.load(std::memory_order_relaxed);
 }
 
 long get_local_gmtoff() {
-    /* 夏令时期间本地时间比标准时间快1小时，偏移量也必须体现这1小时
-     * Daylight saving time puts the local time one hour ahead of standard time,
-     * so it must be reflected by the offset as well. */
-    return -_current_timezone.load(std::memory_order_relaxed) + 3600 * get_daylight_active();
+    return _local_gmtoff.load(std::memory_order_relaxed);
 }
 
 static int is_leap_year(time_t year) {
@@ -97,14 +98,13 @@ void no_locks_localtime(struct tm *tmp, time_t t) {
      * Take a single snapshot of the offset, so that a concurrent
      * local_time_refresh() cannot make the broken down time and tm_gmtoff
      * disagree with each other. */
-    int daylight_active = get_daylight_active();
-    long gmtoff = -_current_timezone.load(std::memory_order_relaxed) + 3600 * daylight_active;
+    long gmtoff = get_local_gmtoff();
 
     t += gmtoff; /* Adjust for timezone and daylight time. */
     time_t days = t / secs_day; /* Days passed since epoch. */
     time_t seconds = t % secs_day; /* Remaining seconds. */
 
-    tmp->tm_isdst = daylight_active;
+    tmp->tm_isdst = get_daylight_active();
     tmp->tm_hour = seconds / secs_hour;
     tmp->tm_min = (seconds % secs_hour) / secs_min;
     tmp->tm_sec = (seconds % secs_hour) % secs_min;
@@ -145,47 +145,10 @@ void no_locks_localtime(struct tm *tmp, time_t t) {
 }
 
 void local_time_init() {
-    /* Obtain timezone and daylight info. */
-    tzset(); /* Now 'timezome' global is populated. */
-#if defined(__linux__) || defined(__sun)
-    _current_timezone  = timezone;
-#elif defined(_WIN32)
-    time_t time_utc;
-    struct tm tm_local;
-
-    // Get the UTC time
-    time(&time_utc);
-
-    // Get the local time
-    // Use localtime_r for threads safe for linux
-    //localtime_r(&time_utc, &tm_local);
-    localtime_s(&tm_local, &time_utc);
-
-    time_t time_local;
-    struct tm tm_gmt;
-
-    // Change tm to time_t
-    time_local = mktime(&tm_local);
-
-    // Change it to GMT tm
-    //gmtime_r(&time_utc, &tm_gmt);//linux
-    gmtime_s(&tm_gmt, &time_utc);
-
-    int time_zone = tm_local.tm_hour - tm_gmt.tm_hour;
-    if (time_zone < -12) {
-        time_zone += 24;
-    }
-    else if (time_zone > 12) {
-        time_zone -= 24;
-    }
-
-    _current_timezone = time_zone;
-#else
-    struct timeval tv;
-    struct timezone tz;
-    gettimeofday(&tv, &tz);
-    _current_timezone = tz.tz_minuteswest * 60L;
-#endif
+    /* 偏移量由local_time_refresh()从localtime()取得，此处只需保证TZ已被解析
+     * The offset is taken from localtime() by local_time_refresh(), so all that is
+     * needed here is to make sure TZ has been parsed */
+    tzset();
     local_time_refresh();
 }
 
@@ -199,8 +162,13 @@ void local_time_refresh() {
     struct tm aux;
 #ifdef _WIN32
     localtime_s(&aux, &t);
+    /* Windows的struct tm没有tm_gmtoff，把本地时间当成UTC反解即可得到偏移
+     * The struct tm of Windows has no tm_gmtoff, interpreting the local time as if
+     * it were UTC gives the offset back */
+    _local_gmtoff.store((long)(_mkgmtime(&aux) - t), std::memory_order_relaxed);
 #else
     localtime_r(&t, &aux);
+    _local_gmtoff.store(aux.tm_gmtoff, std::memory_order_relaxed);
 #endif
     _daylight_active.store(aux.tm_isdst > 0 ? 1 : 0, std::memory_order_relaxed);
 }

@@ -320,18 +320,24 @@ const char *strcasestr(const char *big, const char *little);
 
 /**
  * 获取时间差, 返回值单位为秒
- * 注意: 内部每60秒会校准一次夏令时状态, 校准时会调用localtime并由glibc加锁;
- * 若程序在多线程状态下fork(), 且子进程继续取本地时间(例如打印日志),
- * 则存在极小概率继承到一把不会被释放的锁而永久阻塞, 这类程序需自行用pthread_atfork()保护
  * Get time difference, return value in seconds
- * Note: the daylight saving state is recalibrated once every 60 seconds, and the
- * calibration calls localtime(), which takes a lock inside glibc; should the program
- * fork() from a multi-threaded context and the child process keep getting the local
- * time (printing logs for instance), there is a tiny chance for it to inherit a lock
- * that is never released and block forever, such programs should guard it themselves
- * with pthread_atfork()
  
  * [AUTO-TRANSLATED:43d2403a]
+ *
+ * 注意1: 返回值会随夏令时切换而变化, 调用方不能把它当成常量缓存
+ * 注意2: 该函数最多每60秒校准一次, 所以夏令时切换最迟在60秒后才会生效
+ * 注意3(仅非Windows): 校准会调用localtime_r, glibc内部会加锁; 若程序在多线程状态下
+ *       fork(), 且子进程继续取本地时间(例如打印日志), 则存在极小概率继承到一把不会被
+ *       释放的锁而永久阻塞, 这类程序需自行用pthread_atfork()保护
+ * Note 1: the return value changes when the daylight saving time switches, callers
+ *       must not cache it as if it were a constant
+ * Note 2: it is calibrated at most once every 60 seconds, so a daylight saving time
+ *       switch takes up to 60 seconds to be picked up
+ * Note 3 (non Windows only): the calibration calls localtime_r(), which takes a lock
+ *       inside glibc; should the program fork() from a multi-threaded context and the
+ *       child process keep getting the local time (printing logs for instance), there
+ *       is a tiny chance for it to inherit a lock that is never released and block
+ *       forever, such programs should guard it themselves with pthread_atfork()
  */
 long getGMTOff();
 
@@ -369,18 +375,22 @@ std::string getTimeStr(const char *fmt,time_t time = 0);
 
 /**
  * 根据unix时间戳获取本地时间
- * 注意1: 夏令时状态是全局的, 按"当前时刻"取得, 查询非当前季节的时间戳会相差1小时
- * 注意2: 与getGMTOff()共用同一套校准机制, fork()相关的限制同样适用
  * @param sec unix时间戳
  * @return tm结构体
  * Get local time based on Unix timestamp
- * Note 1: the daylight saving state is global and reflects the current moment, so a
- * timestamp belonging to another season is off by one hour
- * Note 2: it shares the calibration with getGMTOff(), the same fork() caveat applies
  * @param sec Unix timestamp
  * @return tm structure
  
  * [AUTO-TRANSLATED:22a03a5b]
+ *
+ * 以下两点仅适用于非Windows平台(Windows直接调用localtime_s, 不受影响):
+ * 注意1: 时区偏移按"当前时刻"取得并套用于所有时间戳, 查询非当前季节的时间戳会相差1小时
+ * 注意2: 与getGMTOff()共用同一套校准机制, 其注意2、注意3同样适用
+ * The two points below apply to non Windows platforms only (Windows calls
+ * localtime_s() directly and is not affected):
+ * Note 1: the timezone offset reflects the current moment and is applied to every
+ *       timestamp, so a timestamp belonging to another season is off by one hour
+ * Note 2: it shares the calibration with getGMTOff(), whose notes 2 and 3 apply here
  */
 struct tm getLocalTime(time_t sec);
 

@@ -544,10 +544,16 @@ void FileChannel::write(const Logger &logger, const LogContextPtr &ctx) {
     //这条日志所在第几天
     auto day = getDay(second);
     if ((int64_t) day != _last_day) {
-        if (_last_day != -1) {
+        if (_last_day != -1 && (int64_t) day > _last_day) {
             //重置日志index
             _index = 0;
         }
+        //夏令时结束会让本地日期回退，此时不能重置index，
+        //否则会以追加方式重新打开当天已有的第一个切片，使其超出单文件大小上限、切片时序错乱
+        //The local date goes backwards when the daylight saving time ends, the index
+        //must not be reset then, otherwise the first slice already written that day
+        //would be reopened in append mode, growing past the size limit and mixing up
+        //the chronological order of the slices
         //这条日志是新的一天，记录这一天
         _last_day = day;
         //获取日志当天对应的文件，每天可能有多个日志切片文件
@@ -604,7 +610,15 @@ void FileChannel::checkSize(time_t second) {
 }
 
 void FileChannel::changeFile(time_t second) {
-    auto log_file = getLogFilePath(_dir, second, _index++);
+    //夏令时结束会让本地日期回退到当天已经写过日志的时段，需要跳过已存在的切片，
+    //否则会以追加方式写入旧切片，使其超出单文件大小上限
+    //The local date goes backwards when the daylight saving time ends, landing on a
+    //day that already has slices; they must be skipped, otherwise an old slice would
+    //be written in append mode and grow past the size limit
+    string log_file;
+    do {
+        log_file = getLogFilePath(_dir, second, _index++);
+    } while (_log_file_map.count(log_file));
     //记录所有的日志文件，以便后续删除老的日志
     _log_file_map.emplace(log_file);
     //打开新的日志文件

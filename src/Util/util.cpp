@@ -391,9 +391,6 @@ int vasprintf(char **strp, const char *fmt, va_list ap) {
 
 #endif //WIN32
 
-//时间差，已包含夏令时修正
-//Time difference, daylight saving time correction included
-static atomic<long> s_gmtoff { 0 };
 //上次校准时间差的时间点
 //The moment the time difference was calibrated last time
 static atomic<time_t> s_gmtoff_time { 0 };
@@ -402,11 +399,18 @@ static atomic<time_t> s_gmtoff_time { 0 };
 //long a daylight saving time switch takes to be picked up
 static constexpr time_t s_gmtoff_refresh_interval = 60;
 
-//查询当前时间差；其依赖的系统接口需要加锁且不是fork安全的，所以调用频次必须受控
-//Query the current time difference; the system interfaces it relies on take a lock
-//and are not fork() friendly, so it must not be called at a high rate
-static long queryGMTOff() {
 #ifdef _WIN32
+//Windows下的时间差需要向系统查询后自行缓存；其它平台直接取local_time.cpp里的偏移，
+//不再保留第二份缓存，以免两者在刷新瞬间互相矛盾
+//On Windows the time difference has to be queried from the system and cached here;
+//on the other platforms the offset kept by local_time.cpp is read directly, a second
+//cache is not kept so that the two can never disagree while being refreshed
+static atomic<long> s_gmtoff { 0 };
+
+//查询当前时间差；该系统接口需要加锁，所以调用频次必须受控
+//Query the current time difference; this system interface takes a lock, so it must
+//not be called at a high rate
+static long queryGMTOff() {
     TIME_ZONE_INFORMATION tzinfo;
     DWORD dwStandardDaylight;
     long bias;
@@ -421,14 +425,8 @@ static long queryGMTOff() {
         bias += tzinfo.DaylightBias;
     }
     return -bias * 60; //时间差(分钟)
-#else
-    //先刷新夏令时状态，确保时间差与getLocalTime()使用的偏移一致
-    //Refresh the daylight saving state first, so that the time difference agrees
-    //with the offset used by getLocalTime()
-    local_time_refresh();
-    return get_local_gmtoff();
-#endif // _WIN32
 }
+#endif // _WIN32
 
 //夏令时会在程序运行期间切换，所以时间差需要定期校准
 //校准会走到localtime，glibc内部会加锁，于是留下一个极小的窗口：每60秒约1微秒，
@@ -457,20 +455,29 @@ static void refreshGMTOff() {
         //Another thread is calibrating
         return;
     }
+#ifdef _WIN32
     s_gmtoff.store(queryGMTOff(), memory_order_relaxed);
+#else
+    local_time_refresh();
+#endif // _WIN32
 }
 
 static onceToken s_token([]() {
-#ifndef _WIN32
+#ifdef _WIN32
+    s_gmtoff.store(queryGMTOff(), memory_order_relaxed);
+#else
     local_time_init();
 #endif // _WIN32
-    s_gmtoff.store(queryGMTOff(), memory_order_relaxed);
     s_gmtoff_time.store(::time(nullptr), memory_order_relaxed);
 });
 
 long getGMTOff() {
     refreshGMTOff();
+#ifdef _WIN32
     return s_gmtoff.load(memory_order_relaxed);
+#else
+    return get_local_gmtoff();
+#endif // _WIN32
 }
 
 static inline uint64_t getCurrentMicrosecondOrigin() {
