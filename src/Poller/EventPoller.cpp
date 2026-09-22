@@ -299,7 +299,14 @@ Task::Ptr EventPoller::async_l(TaskIn task, bool may_sync, bool first) {
     //Write data to the pipe and wake up the main thread
     {
         auto wret = _pipe.write("", 1);
-        ::fprintf(stderr, "[DIAG] pipe.write ret=%d\n", (int)wret); ::fflush(stderr);
+        if (wret != 1) {
+#if defined(_WIN32)
+            ::fprintf(stderr, "[DIAG] pipe.write FAILED ret=%d wsa_err=%d\n", (int)wret, WSAGetLastError());
+#else
+            ::fprintf(stderr, "[DIAG] pipe.write FAILED ret=%d errno=%d\n", (int)wret, errno);
+#endif
+            ::fflush(stderr);
+        }
     }
     return ret;
 }

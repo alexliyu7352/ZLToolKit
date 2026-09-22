@@ -33,6 +33,7 @@ static onceToken g_token([]() {
     WSADATA wsaData;
     WSAStartup(wVersionRequested, &wsaData);
 }, []() {
+    ::fprintf(stderr, "[DIAG] WSACleanup called\n"); ::fflush(stderr);
     WSACleanup();
 });
 int ioctl(int fd, long cmd, u_long *ptr) {
