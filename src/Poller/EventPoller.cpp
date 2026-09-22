@@ -114,7 +114,20 @@ EventPoller::~EventPoller() {
     
 #if defined(HAS_EPOLL) || defined(HAS_KQUEUE)
     if (_event_fd != INVALID_EVENT_FD) {
-        close_event(_event_fd);
+        bool can_close = true;
+#if defined(_WIN32)
+        //轮询线程没有正常走出循环,说明它是被系统强行终止的(进程退出时Windows会先杀掉其余线程)。
+        //它在epoll_wait里持有的wepoll引用因此永远不会释放,epoll_close会一直等下去。
+        //进程马上就要结束,把句柄留给系统回收即可
+        //The polling thread never left its loop, so it was killed by the system: Windows terminates the
+        //other threads first while a process exits. The wepoll reference it holds inside epoll_wait is
+        //therefore never released and epoll_close would wait forever. The process is about to end, so
+        //leave the handle for the system to reclaim
+        can_close = _exit_flag;
+#endif
+        if (can_close) {
+            close_event(_event_fd);
+        }
         _event_fd = INVALID_EVENT_FD;
     }
 #endif
