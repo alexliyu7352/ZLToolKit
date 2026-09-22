@@ -400,30 +400,22 @@ int vasprintf(char **strp, const char *fmt, va_list ap) {
 //often than not) is not necessarily lock free on a 32 bit platform
 static atomic<uint32_t> s_gmtoff_quarter { 0 };
 
-//校准按一刻钟对齐。实测时区数据库2020至2036年的6722次夏令时切换，按UTC时刻计
-//96.44%发生在整点、3.51%在30分，仅3次(Antarctica/Casey的16:01 UTC)不在刻钟边界上。
-//于是跨过边界后即可发现切换，比固定周期轮询更及时，又把取锁次数从每天1440次降到96次;
-//对那3次未对齐的切换则最迟15分钟收敛，属温和降级。具体百分比随时区数据库版本浮动，
-//不可当作不变量
-//The calibration is aligned to a quarter of an hour. Of the 6722 daylight saving switches in the
-//timezone database between 2020 and 2036, measured in UTC, 96.44% happen on the hour and 3.51%
-//at 30 minutes past; only 3 of them (Antarctica/Casey at 16:01 UTC) do not land on a quarter
-//hour boundary. Crossing a boundary therefore reveals a switch, which is more prompt than
-//polling on a fixed period and cuts the lock acquisitions from 1440 a day down to 96; those 3
-//unaligned switches converge within 15 minutes at worst, a mild degradation. The exact
-//percentages move with the timezone database version and are not to be taken as invariants
-//默认一刻钟；可用环境变量覆盖，主要是为了让自动化测试不必真的等上一刻钟才能验证
-//校准机制仍在工作——"夏令时切换后偏移不再更新"是这条链路唯一的真实故障模式，
-//却又恰恰是最难在短时用例里复现的。
-//必须是函数内静态：命名空间作用域的动态初始化在跨编译单元时顺序未定义，静态链接时
-//下游若在全局构造函数里取一次时间，就会读到尚未初始化的0并当场除零(SIGFPE)。
-//A quarter of an hour by default, overridable through an environment variable, mainly so that
-//automated tests need not really wait a quarter of an hour to verify that the calibration still
-//happens: "the offset stops being updated after a switch" is the one real failure mode of this
-//path and also the hardest to reproduce in a short test.
-//It has to be a function local static: the initialization order of namespace scope dynamic
-//initializers is unspecified across translation units, so with static linking a downstream
-//global constructor fetching the time once would read a still zero value and divide by it.
+//按一刻钟对齐：夏令时切换几乎总落在刻钟边界上(实测2020-2036年的6722次切换，按UTC计
+//仅3次例外，均为Antarctica/Casey)，故跨过边界即可发现，比定时轮询更及时，取锁次数
+//也从每天1440次降到96次；未对齐的那几次最迟一刻钟后收敛
+//Aligned to a quarter of an hour: a daylight saving switch almost always lands on such a
+//boundary (of the 6722 switches between 2020 and 2036, measured in UTC, only 3 do not, all of
+//them Antarctica/Casey), so crossing one reveals it, more promptly than polling on a timer and
+//cutting lock acquisitions from 1440 a day down to 96; the few unaligned ones converge within a
+//quarter of an hour
+//校准的对齐粒度，默认一刻钟；环境变量只允许调小，用于自动化测试，若允许调大则一个
+//误设的巨值会静默地让校准不再发生。必须是函数内静态：命名空间作用域的动态初始化
+//跨编译单元顺序未定义，静态链接下若有人在全局构造里取时间，会读到0并除零。
+//The alignment of the calibration, a quarter of an hour by default; the environment variable may
+//only shrink it, for automated tests, since letting it grow would let one mistyped value stop the
+//calibration silently. A function local static is required: namespace scope dynamic
+//initialization has no defined order across translation units, so under static linking a global
+//constructor fetching the time would read a still zero value and divide by it.
 static time_t gmtoffAlign() {
     static const time_t align = []() {
         constexpr time_t kDefault = 15 * 60;
@@ -475,32 +467,22 @@ static long queryGMTOff() {
 }
 #endif // _WIN32
 
-//夏令时会在程序运行期间切换，所以时间差需要定期校准。校准会走到localtime，glibc内部
-//会加锁，因而留下一个窗口：约1微秒，每刻钟一次。若fork()恰好落在该窗口内，子进程会
-//继承一把永不释放的锁。
-//注意其影响面：getLocalTime()与getGMTOff()本身已只读缓存，子进程调用它们不会再阻塞;
-//但子进程若自行调用mktime/localtime或走tzset的strftime，仍会撞上那把锁——本库
-//FileChannel::clean()经getLogFileTime()调用mktime即是一例。
-//此处不用pthread_atfork()兜底，因为那是进程级的全局钩子，基础库不宜代使用者注册。
-//The daylight saving time switches while the program is running, hence the time difference has
-//to be calibrated periodically. The calibration ends up in localtime(), which takes a lock
-//inside glibc, leaving a window of roughly one microsecond once every quarter of an hour;
-//should fork() fall into it, the child inherits a lock that is never released.
-//Note how far that reaches: getLocalTime() and getGMTOff() themselves only read the cache now,
-//so calling them from the child no longer blocks; but a child calling mktime/localtime on its
-//own, or an strftime that goes through tzset, still meets that lock, as does this library's own
-//FileChannel::clean() through the mktime in getLogFileTime().
-//No pthread_atfork() guard is installed here because that hook is process wide and a base
-//library should not register one on behalf of its users.
-//跨过刻钟边界的那一次调用才会真正校准，其余调用只是一次除法加一次原子比较。
-//时间戳线程每0.5ms醒来一次、几乎总是抢先跨过边界并更新刻钟序号，因此取本地时间的
-//调用方极少真正走到localtime；但这只是概率上的，不是保证——不去区分"谁在岗"，
-//因为那种标志会被fork继承，而子进程并不会继承线程，反倒造成子进程永不校准
-//Only the call that crosses a quarter hour boundary actually calibrates, every other one is a
-//division and an atomic comparison. The timestamp thread wakes every 0.5ms and almost always
-//crosses the boundary first, so a caller fetching the local time rarely reaches localtime; that
-//is a matter of probability, not a guarantee. No "who is on duty" flag is kept, because such a
-//flag survives fork() while the thread does not, which would leave the child never calibrating
+//校准会走到localtime，glibc内部加锁，因而每刻钟留下约1微秒的窗口；fork恰落其中时子进程
+//会继承一把永不释放的锁。子进程若自行调用mktime/localtime仍会撞上——本库
+//FileChannel::clean()经getLogFileTime()即是一例。不用pthread_atfork()兜底：那是进程级
+//全局钩子，基础库不宜代使用者注册。
+//The calibration reaches localtime, which locks inside glibc, leaving a window of about a
+//microsecond every quarter of an hour; a fork() landing in it leaves the child holding a lock
+//that is never released. A child calling mktime or localtime on its own still meets it, as does
+//this library's FileChannel::clean() through getLogFileTime(). No pthread_atfork() guard is
+//installed: that hook is process wide and a base library should not register one for its users.
+//只有跨过刻钟边界的那一次调用才真正校准，其余只是一次除法加一次原子比较。时间戳线程
+//每0.5ms醒来一次，多数情况下由它抢先跨过边界，但这是概率而非保证。
+//不去区分"时间戳线程是否在岗"：那种标志会被fork继承而线程不会，子进程将因此永不校准
+//Only the call crossing a quarter hour boundary calibrates, the rest is a division and an atomic
+//comparison. The timestamp thread wakes every 0.5ms and usually crosses first, but that is a
+//matter of probability, not a guarantee. No "is the thread on duty" flag is kept: such a flag
+//survives fork() while the thread does not, leaving the child process never calibrating
 static void refreshGMTOff(time_t now) {
     auto quarter = (uint32_t)(now / gmtoffAlign());
     auto last = s_gmtoff_quarter.load(memory_order_relaxed);

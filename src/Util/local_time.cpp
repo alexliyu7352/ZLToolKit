@@ -69,19 +69,14 @@ static std::atomic<int> _daylight_active { 0 };
  * Offset of the local time from UTC in seconds, taken from the tm_gmtoff of
  * localtime(), daylight saving time included */
 static std::atomic<long> _local_gmtoff { 0 };
-/* 时区缩写(如CST、EDT)。此处保存的是内容而非localtime()给出的指针：各家libc对该指针
- * 指向内存的生命周期约定互不相同——glibc的字符串永久驻留，musl指向mmap进来的时区文件
- * 且TZ变化时会将其munmap(保存指针会悬垂)，BSD与macOS则是就地覆写内容(会读到写了一半的
- * 缩写)。与其依赖某一家的实现细节，不如拷出来自己管。
- * 两块缓冲轮换：写入非当前的那块，再发布索引，读者因而永远看到完整的一份。
- * The timezone abbreviation (CST, EDT and so on). What is kept here is the content rather than
- * the pointer localtime() hands out: the lifetime of the memory that pointer refers to differs
- * from one libc to another. In glibc the string lives forever; in musl it points into the mmapped
- * timezone file, which is munmapped when TZ changes, so a saved pointer dangles; on BSD and macOS
- * the content is overwritten in place, so a reader may catch a half written abbreviation. Rather
- * than depending on any one of those, the content is copied and owned here.
- * Two buffers take turns: the one that is not current gets written and the index is published
- * afterwards, so a reader always sees a complete copy. */
+/* 时区缩写(如CST、EDT)。保存的是内容而非localtime()给出的指针：各家libc对该指针所指
+ * 内存的生命周期约定不同，musl上TZ一变就会munmap掉(保存指针会悬垂、解引用即崩溃，已实测)。
+ * 两块缓冲轮换：写非当前的那块，再发布索引，读者因而总能看到完整的一份。
+ * The timezone abbreviation (CST, EDT and so on). The content is kept rather than the pointer
+ * localtime() hands out: libcs differ on the lifetime of the memory it refers to, and on musl a
+ * change of TZ munmaps it, so a saved pointer dangles and crashes on dereference (measured).
+ * Two buffers take turns: the one not in use is written and the index published afterwards, so a
+ * reader always sees a complete copy. */
 static char _zone_name[2][16] = { "UTC", "UTC" };
 static std::atomic<int> _zone_index { 0 };
 
@@ -109,14 +104,11 @@ void no_locks_localtime(struct tm *tmp, time_t t) {
     const time_t secs_hour = 3600;
     const time_t secs_day = 3600 * 24;
 
-    /* 偏移量只取一次快照，使换算出的时刻与tm_gmtoff必定同源。
-     * 注意tm_isdst与tm_zone是另外两个独立的原子量，夏令时切换的那一瞬(纳秒级、一年两次)
-     * 三者未必互洽，可能出现"新偏移配旧的tm_isdst"，此时时刻本身仍是对的。
-     * Take a single snapshot of the offset so that the broken down time and tm_gmtoff always
-     * come from the same source. Note that tm_isdst and tm_zone are two further independent
-     * atomics: at the very instant of a switch (a matter of nanoseconds, twice a year) the three
-     * need not agree, a new offset may come with a stale tm_isdst, while the time itself stays
-     * correct. */
+    /* 偏移量只取一次快照，使换算出的时刻与tm_gmtoff必定同源；tm_isdst与tm_zone是另外两个
+     * 独立原子量，切换那一瞬三者未必互洽(时刻本身仍是对的)。
+     * A single snapshot of the offset keeps the broken down time and tm_gmtoff from the same
+     * source; tm_isdst and tm_zone are two further independent atomics and the three need not
+     * agree at the very instant of a switch, though the time itself stays correct. */
     int daylight_active = get_daylight_active();
     long gmtoff = get_local_gmtoff();
 
@@ -186,10 +178,8 @@ void local_time_refresh() {
     struct tm aux;
 #ifdef _WIN32
     localtime_s(&aux, &t);
-    /* _mkgmtime会就地改写整个struct tm(UCRT内部以gmtime的结果整体替换)，
-     * 其中tm_isdst会被置0，故必须先取出来
-     * _mkgmtime rewrites the whole struct tm in place (the UCRT replaces it wholesale with the
-     * result of gmtime), tm_isdst among them being reset to zero, so it has to be read first */
+    /* _mkgmtime会就地改写整个struct tm并把tm_isdst置0，故先取出来
+     * _mkgmtime rewrites the whole struct tm in place and resets tm_isdst, so read it first */
     int isdst = aux.tm_isdst;
     /* Windows的struct tm没有tm_gmtoff，把本地时间当成UTC反解即可得到偏移
      * The struct tm of Windows has no tm_gmtoff, interpreting the local time as if
