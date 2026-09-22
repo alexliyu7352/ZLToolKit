@@ -259,6 +259,12 @@ private:
     void shutdownAndFlush();
 
     /**
+     * 关闭(或在无法安全关闭时放弃)epoll/kqueue句柄，可重复调用
+     * Close the epoll/kqueue handle, or give it up when it cannot be closed safely; idempotent
+     */
+    void closeEventFd();
+
+    /**
      * 刷新延时任务
      * Refresh delayed tasks
      * [AUTO-TRANSLATED:88104b90]
