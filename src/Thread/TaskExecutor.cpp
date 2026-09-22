@@ -241,7 +241,19 @@ TaskExecutorGetterImp::~TaskExecutorGetterImp() {
     //here: both EventPollerPool and WorkThreadPool fill it with EventPoller through addPoller(),
     //so both need the very same teardown
     for (auto &th : _threads) {
-        static_pointer_cast<EventPoller>(th)->shutdown();
+        auto poller = static_pointer_cast<EventPoller>(th);
+        //逐个处理而不是先把所有轮询线程一次停掉:处理到第i个时,其后的轮询线程仍在运行,
+        //于是第i个的残留任务若要投递给它们,依旧会在对方的轮询线程上异步执行。
+        //本库的调用方(如ZLMediaKit)大量依赖"某对象只在其所属轮询线程上被访问"来省掉锁,
+        //一次性停掉全部线程会使这类任务退化为在本线程同步执行,从而打破该约定
+        //Handle them one by one instead of stopping every polling thread up front: while the
+        //i-th is being handled the later ones are still running, so a leftover task of the i-th
+        //that has to be posted to them still runs asynchronously on their own polling thread.
+        //Users of this library (ZLMediaKit for one) widely rely on "this object is only touched
+        //on its own polling thread" to avoid locking, and stopping every thread at once would
+        //degrade such tasks into running synchronously here, breaking that assumption
+        poller->shutdownAndFlush();
+        th = nullptr;
     }
 }
 

@@ -104,6 +104,16 @@ void EventPoller::shutdown() {
     }
 }
 
+void EventPoller::shutdownAndFlush() {
+    shutdown();
+    //轮询线程已停，队列里剩下的任务改在调用者线程上执行。这些任务(例如Socket析构)往往持有
+    //本对象的引用，若留给轮询线程执行，本对象就会死在自己的线程里
+    //The polling thread has stopped, so whatever is left in the queue runs on the caller thread.
+    //Such tasks (the destruction of a Socket for instance) usually hold a reference to this
+    //object, and letting the polling thread run them would make the object die on its own thread
+    onPipeEvent(true);
+}
+
 EventPoller::~EventPoller() {
     shutdown();
     
