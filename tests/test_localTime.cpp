@@ -17,6 +17,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 #include "Util/local_time.h"
 #include "Util/util.h"
@@ -227,18 +230,17 @@ static bool calibrationStillHappens() {
     //While the timestamp thread is on duty it calibrates, otherwise the caller does; the offset
     //is expected to converge either way
     for (int round = 0; round < 2; ++round) {
-        if (round == 1) {
-            getCurrentMillisecond();  //第二轮先把时间戳线程拉起来
-        }
+        //改时区要赶在时间戳线程启动之前：setenv会重新分配environ，而线程里的
+        //localtime_r会去读它，两者并发是glibc已知的数据竞争(TSAN必报)
+        //The timezone has to be changed before the timestamp thread starts: setenv reallocates
+        //environ while localtime_r in that thread reads it, a data race glibc is known for and
+        //that TSAN always reports
         useTimezone("UTC0");
-        const char *tz = "CST-8";
-#ifdef _WIN32
-        _putenv_s("TZ", tz);
-        _tzset();
-#else
-        setenv("TZ", tz, 1);
+        setenv("TZ", "CST-8", 1);
         tzset();
-#endif
+        if (round == 1) {
+            getCurrentMillisecond();  //第二轮再把时间戳线程拉起来
+        }
         //改完时区后不再手动刷新，等库自己发现
         //No manual refresh after changing the timezone, the library has to notice by itself
         bool ok = false;
@@ -260,7 +262,31 @@ static bool calibrationStillHappens() {
 }
 #endif
 
-int main() {
+int main(int argc, char *argv[]) {
+#ifndef _WIN32
+    //校准的对齐粒度在库的静态初始化阶段就被读走，到main里再setenv已经太晚，
+    //而"校准是否仍在发生"那条用例又不可能真的等上一刻钟。此处在缺少该变量时
+    //把自己重启一次——否则直接运行本二进制(不经ctest)必然失败，而那种"必失败"
+    //最容易诱使后来者去改用例本身
+    //The alignment of the calibration is read during the static initialization of the library,
+    //so setting it from main would already be too late, while the case checking that the
+    //calibration still happens cannot really wait a quarter of an hour. The binary restarts
+    //itself once when the variable is missing: otherwise running it directly, outside ctest,
+    //would always fail, and such a guaranteed failure is exactly what tempts someone to go and
+    //change the case instead
+    if (!getenv("ZLTOOLKIT_GMTOFF_ALIGN") && !getenv("ZLTOOLKIT_TEST_RESPAWNED")) {
+        setenv("ZLTOOLKIT_GMTOFF_ALIGN", "1", 1);
+        setenv("ZLTOOLKIT_TEST_RESPAWNED", "1", 1);
+        execv(argv[0], argv);
+        //重启失败也不致命，只是下面那条用例会因为要等一刻钟而超时
+        //A failed restart is not fatal, it only makes the case below time out waiting a quarter
+        printf("[WARN] 自我重启失败，校准用例可能需要等待一刻钟\n");
+    }
+#else
+    (void)argc;
+    (void)argv;
+#endif
+
     //记录原有TZ，测试结束后恢复
     //Remember the original TZ and restore it when the test is over
     const char *old_tz = getenv("TZ");
@@ -314,9 +340,15 @@ int main() {
     if (saved_tz.empty()) {
 #ifdef _WIN32
         _putenv_s("TZ", "");
+        _tzset();
 #else
         unsetenv("TZ");
+        tzset();
 #endif
+        //同样要刷新，否则本进程后续(例如日志)仍用着测试期间的最后一个时区
+        //Refresh here as well, otherwise the rest of this process, logging included, would keep
+        //using whatever timezone the test left behind
+        local_time_refresh();
     } else {
         useTimezone(saved_tz.data());
     }

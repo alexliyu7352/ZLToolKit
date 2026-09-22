@@ -393,37 +393,51 @@ int vasprintf(char **strp, const char *fmt, va_list ap) {
 
 //上次校准时间差时所处的刻钟序号
 //The quarter hour in which the time difference was calibrated last time
-static atomic<time_t> s_gmtoff_quarter { 0 };
-//时间戳线程是否在岗。它在岗时由它负责校准，取本地时间的路径一概只读缓存；
-//它不在岗时(例如只用了日志模块的程序，ZLMediaKit那个只监控子进程的守护父进程即是)
-//则由调用方自己兜底校准，否则夏令时切换后偏移将永远不再更新
-//Whether the timestamp thread is on duty. While it is, the calibration is its job and the
-//paths fetching the local time only read the cache; while it is not (a program using only the
-//logging module, such as the ZLMediaKit daemon parent that merely supervises its child), the
-//caller calibrates instead, otherwise the offset would never be updated again after a switch
-static atomic<bool> s_stamp_thread_on_duty { false };
+//存的是刻钟序号而非时间戳，故用32位即可：只做相等性比较，截断不影响判断，
+//而32位平台上atomic<time_t>(time_t常为64位)未必是无锁的
+//A quarter hour index rather than a timestamp is stored, so 32 bits are enough: only equality
+//is tested and truncation does not affect it, whereas atomic<time_t> (time_t being 64 bit more
+//often than not) is not necessarily lock free on a 32 bit platform
+static atomic<uint32_t> s_gmtoff_quarter { 0 };
+
 //校准按一刻钟对齐。实测时区数据库2020至2036年的6722次夏令时切换，按UTC时刻计
 //96.44%发生在整点、3.51%在30分，仅3次(Antarctica/Casey的16:01 UTC)不在刻钟边界上。
 //于是跨过边界后即可发现切换，比固定周期轮询更及时，又把取锁次数从每天1440次降到96次;
-//对那3次未对齐的切换则最迟15分钟收敛，属温和降级
+//对那3次未对齐的切换则最迟15分钟收敛，属温和降级。具体百分比随时区数据库版本浮动，
+//不可当作不变量
 //The calibration is aligned to a quarter of an hour. Of the 6722 daylight saving switches in the
 //timezone database between 2020 and 2036, measured in UTC, 96.44% happen on the hour and 3.51%
 //at 30 minutes past; only 3 of them (Antarctica/Casey at 16:01 UTC) do not land on a quarter
 //hour boundary. Crossing a boundary therefore reveals a switch, which is more prompt than
 //polling on a fixed period and cuts the lock acquisitions from 1440 a day down to 96; those 3
-//unaligned switches converge within 15 minutes at worst, a mild degradation
+//unaligned switches converge within 15 minutes at worst, a mild degradation. The exact
+//percentages move with the timezone database version and are not to be taken as invariants
 //默认一刻钟；可用环境变量覆盖，主要是为了让自动化测试不必真的等上一刻钟才能验证
 //校准机制仍在工作——"夏令时切换后偏移不再更新"是这条链路唯一的真实故障模式，
-//却又恰恰是最难在短时用例里复现的
+//却又恰恰是最难在短时用例里复现的。
+//必须是函数内静态：命名空间作用域的动态初始化在跨编译单元时顺序未定义，静态链接时
+//下游若在全局构造函数里取一次时间，就会读到尚未初始化的0并当场除零(SIGFPE)。
 //A quarter of an hour by default, overridable through an environment variable, mainly so that
 //automated tests need not really wait a quarter of an hour to verify that the calibration still
 //happens: "the offset stops being updated after a switch" is the one real failure mode of this
-//path and also the hardest to reproduce in a short test
-static const time_t s_gmtoff_align = []() {
-    auto env = getenv("ZLTOOLKIT_GMTOFF_ALIGN");
-    auto val = env ? atoi(env) : 0;
-    return val > 0 ? (time_t)val : (time_t)(15 * 60);
-}();
+//path and also the hardest to reproduce in a short test.
+//It has to be a function local static: the initialization order of namespace scope dynamic
+//initializers is unspecified across translation units, so with static linking a downstream
+//global constructor fetching the time once would read a still zero value and divide by it.
+static time_t gmtoffAlign() {
+    static const time_t align = []() {
+        constexpr time_t kDefault = 15 * 60;
+        auto env = getenv("ZLTOOLKIT_GMTOFF_ALIGN");
+        auto val = env ? atoi(env) : 0;
+        //只接受比默认值更小的正数：该变量的用途是把校准间隔缩短以便测试，
+        //若允许调大，一个误设的巨大值会让校准实际上不再发生，而这种失效是静默的
+        //Only a positive value smaller than the default is accepted: the point of this variable
+        //is to shorten the interval for testing, and allowing it to grow would let one mistyped
+        //huge value stop the calibration from ever happening, a failure that gives no sign
+        return (val > 0 && val < kDefault) ? (time_t)val : kDefault;
+    }();
+    return align;
+}
 
 #ifdef _WIN32
 //Windows下的时间差需要向系统查询后自行缓存；其它平台直接取local_time.cpp里的偏移，
@@ -478,10 +492,17 @@ static long queryGMTOff() {
 //FileChannel::clean() through the mktime in getLogFileTime().
 //No pthread_atfork() guard is installed here because that hook is process wide and a base
 //library should not register one on behalf of its users.
-//由时间戳线程调用，取本地时间的路径上一律只读缓存、不取锁
-//Called from the timestamp thread; the paths that fetch the local time only read the cache
+//跨过刻钟边界的那一次调用才会真正校准，其余调用只是一次除法加一次原子比较。
+//时间戳线程每0.5ms醒来一次、几乎总是抢先跨过边界并更新刻钟序号，因此取本地时间的
+//调用方极少真正走到localtime；但这只是概率上的，不是保证——不去区分"谁在岗"，
+//因为那种标志会被fork继承，而子进程并不会继承线程，反倒造成子进程永不校准
+//Only the call that crosses a quarter hour boundary actually calibrates, every other one is a
+//division and an atomic comparison. The timestamp thread wakes every 0.5ms and almost always
+//crosses the boundary first, so a caller fetching the local time rarely reaches localtime; that
+//is a matter of probability, not a guarantee. No "who is on duty" flag is kept, because such a
+//flag survives fork() while the thread does not, which would leave the child never calibrating
 static void refreshGMTOff(time_t now) {
-    auto quarter = now / s_gmtoff_align;
+    auto quarter = (uint32_t)(now / gmtoffAlign());
     auto last = s_gmtoff_quarter.load(memory_order_relaxed);
     //仍处在同一刻钟之内，期间不可能发生夏令时切换，直接读缓存即可；
     //系统时间被回拨时刻钟序号同样会变化，因而一并覆盖
@@ -491,7 +512,16 @@ static void refreshGMTOff(time_t now) {
     if (quarter == last) {
         return;
     }
-    s_gmtoff_quarter.store(quarter, memory_order_relaxed);
+    //以比较交换取代普通写入，保证跨过边界时只有一个线程真正去取时区锁。
+    //删掉"谁在岗"的标志之后，调用方与时间戳线程都会走到这里，若只用普通写入，
+    //在写入生效前通过检查的线程会一并挤进去，把那个微秒级的锁窗口放大数倍
+    //A compare and exchange rather than a plain store, so that only one thread actually takes
+    //the timezone lock when a boundary is crossed. Since the "who is on duty" flag was dropped
+    //both callers and the timestamp thread reach this point, and with a plain store every thread
+    //that passed the check before it landed would pile in, multiplying that microsecond window
+    if (!s_gmtoff_quarter.compare_exchange_strong(last, quarter)) {
+        return;
+    }
 #ifdef _WIN32
     s_gmtoff.store(queryGMTOff(), memory_order_relaxed);
 #else
@@ -505,20 +535,11 @@ static onceToken s_token([]() {
 #else
     local_time_init();
 #endif // _WIN32
-    s_gmtoff_quarter.store(::time(nullptr) / s_gmtoff_align, memory_order_relaxed);
+    s_gmtoff_quarter.store((uint32_t)(::time(nullptr) / gmtoffAlign()), memory_order_relaxed);
 });
 
-//时间戳线程不在岗时由调用方兜底校准；它在岗时这里只是一次原子读
-//Calibrate from the caller while the timestamp thread is not on duty; while it is, this is
-//nothing but one atomic read
-static inline void calibrateIfUnattended() {
-    if (!s_stamp_thread_on_duty.load(memory_order_relaxed)) {
-        refreshGMTOff(::time(nullptr));
-    }
-}
-
 long getGMTOff() {
-    calibrateIfUnattended();
+    refreshGMTOff(::time(nullptr));
 #ifdef _WIN32
     return s_gmtoff.load(memory_order_relaxed);
 #else
@@ -548,11 +569,6 @@ static inline bool initMillisecondThread() {
         auto logger = Logger::Instance().shared_from_this();
         setThreadName("stamp thread");
         DebugL << "Stamp thread started";
-        //置于首条日志之后:该日志本身会取本地时间，此前仍应由调用方兜底
-        //Set after the first log line: that line itself fetches the local time and until then
-        //the caller should still be the one calibrating
-        s_stamp_thread_on_duty.store(true, memory_order_relaxed);
-        onceToken token(nullptr, []() { s_stamp_thread_on_duty.store(false, memory_order_relaxed); });
         uint64_t last = getCurrentMicrosecondOrigin();
         uint64_t now;
         uint64_t microsecond = 0;
@@ -642,7 +658,7 @@ struct tm getLocalTime(time_t sec) {
 #ifdef _WIN32
     localtime_s(&tm, &sec);
 #else
-    calibrateIfUnattended();
+    refreshGMTOff(::time(nullptr));
     no_locks_localtime(&tm, sec);
 #endif //_WIN32
     return tm;

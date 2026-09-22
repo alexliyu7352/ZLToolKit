@@ -32,6 +32,7 @@
  */
 
 #include <atomic>
+#include <cstring>
 #include <ctime>
 
 #include "local_time.h"
@@ -68,17 +69,21 @@ static std::atomic<int> _daylight_active { 0 };
  * Offset of the local time from UTC in seconds, taken from the tm_gmtoff of
  * localtime(), daylight saving time included */
 static std::atomic<long> _local_gmtoff { 0 };
-/* 时区缩写(如CST、EDT)，由local_time_refresh()从localtime()的结果中快照而来。
- * 不能直接引用tzname[]：glibc在每一次localtime_r()中都会改写它——先置NULL、算完再写回，
- * 全程由tzset_lock保护，而本文件是不持锁读的，并发下会读到NULL。
- * localtime()返回的tm_zone指向glibc内部永久驻留的字符串，保存其指针是安全的。
- * The timezone abbreviation (CST, EDT and so on), snapshotted by local_time_refresh() from the
- * result of localtime(). Referring to tzname[] directly is not an option: glibc rewrites it on
- * every single localtime_r() call, setting it to NULL first and writing it back afterwards, all
- * of it under tzset_lock while this file reads without holding any lock, so a concurrent reader
- * would observe NULL. The tm_zone returned by localtime() points into a string glibc keeps
- * alive forever, so storing that pointer is safe. */
-static std::atomic<const char *> _local_zone { "UTC" };
+/* 时区缩写(如CST、EDT)。此处保存的是内容而非localtime()给出的指针：各家libc对该指针
+ * 指向内存的生命周期约定互不相同——glibc的字符串永久驻留，musl指向mmap进来的时区文件
+ * 且TZ变化时会将其munmap(保存指针会悬垂)，BSD与macOS则是就地覆写内容(会读到写了一半的
+ * 缩写)。与其依赖某一家的实现细节，不如拷出来自己管。
+ * 两块缓冲轮换：写入非当前的那块，再发布索引，读者因而永远看到完整的一份。
+ * The timezone abbreviation (CST, EDT and so on). What is kept here is the content rather than
+ * the pointer localtime() hands out: the lifetime of the memory that pointer refers to differs
+ * from one libc to another. In glibc the string lives forever; in musl it points into the mmapped
+ * timezone file, which is munmapped when TZ changes, so a saved pointer dangles; on BSD and macOS
+ * the content is overwritten in place, so a reader may catch a half written abbreviation. Rather
+ * than depending on any one of those, the content is copied and owned here.
+ * Two buffers take turns: the one that is not current gets written and the index is published
+ * afterwards, so a reader always sees a complete copy. */
+static char _zone_name[2][16] = { "UTC", "UTC" };
+static std::atomic<int> _zone_index { 0 };
 
 int get_daylight_active() {
     return _daylight_active.load(std::memory_order_relaxed);
@@ -128,7 +133,7 @@ void no_locks_localtime(struct tm *tmp, time_t t) {
     /* tm_zone不填的话就是调用方栈上的未初始化指针，一旦用%Z格式化便会读到非法内存
      * Leaving tm_zone alone would keep whatever uninitialized pointer the caller has on its
      * stack, and formatting with %Z would then read invalid memory */
-    tmp->tm_zone = (char *)_local_zone.load(std::memory_order_acquire);
+    tmp->tm_zone = _zone_name[_zone_index.load(std::memory_order_acquire)];
 #endif
     /* 1/1/1970 was a Thursday, that is, day 4 from the POV of the tm structure
      * where sunday = 0, so to calculate the day of the week we have to add 4
@@ -181,6 +186,11 @@ void local_time_refresh() {
     struct tm aux;
 #ifdef _WIN32
     localtime_s(&aux, &t);
+    /* _mkgmtime会就地改写整个struct tm(UCRT内部以gmtime的结果整体替换)，
+     * 其中tm_isdst会被置0，故必须先取出来
+     * _mkgmtime rewrites the whole struct tm in place (the UCRT replaces it wholesale with the
+     * result of gmtime), tm_isdst among them being reset to zero, so it has to be read first */
+    int isdst = aux.tm_isdst;
     /* Windows的struct tm没有tm_gmtoff，把本地时间当成UTC反解即可得到偏移
      * The struct tm of Windows has no tm_gmtoff, interpreting the local time as if
      * it were UTC gives the offset back */
@@ -188,13 +198,20 @@ void local_time_refresh() {
 #else
     localtime_r(&t, &aux);
     _local_gmtoff.store(aux.tm_gmtoff, std::memory_order_relaxed);
-    if (aux.tm_zone) {
-        /* 与读侧的acquire配对：发布的是指针，读者随后要读它指向的字节
-         * Paired with the acquire on the reading side: what is published is a pointer whose
-         * bytes the reader goes on to read */
-        _local_zone.store(aux.tm_zone, std::memory_order_release);
+    if (aux.tm_zone && aux.tm_zone[0]) {
+        /* 写入当前未被使用的那块缓冲，再以release发布索引，与读侧的acquire配对
+         * Write into whichever buffer is not in use and publish the index with a release,
+         * paired with the acquire on the reading side */
+        auto next = 1 - _zone_index.load(std::memory_order_relaxed);
+        strncpy(_zone_name[next], aux.tm_zone, sizeof(_zone_name[next]) - 1);
+        _zone_name[next][sizeof(_zone_name[next]) - 1] = '\0';
+        _zone_index.store(next, std::memory_order_release);
     }
 #endif
+#ifdef _WIN32
+    _daylight_active.store(isdst > 0 ? 1 : 0, std::memory_order_relaxed);
+#else
     _daylight_active.store(aux.tm_isdst > 0 ? 1 : 0, std::memory_order_relaxed);
+#endif
 }
 } // namespace toolkit

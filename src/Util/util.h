@@ -325,15 +325,15 @@ const char *strcasestr(const char *big, const char *little);
  * [AUTO-TRANSLATED:43d2403a]
  *
  * 注意1: 返回值会随夏令时切换而变化, 调用方不能把它当成常量缓存
- * 注意2: 本函数只读缓存, 不加锁也不阻塞。偏移由时间戳线程按一刻钟边界校准(夏令时切换
- *       必然落在该边界上), 该线程在首次调用getCurrentMillisecond()等接口时启动——也就是
+ * 注意2: 本函数只读缓存, 不加锁也不阻塞。偏移按一刻钟边界校准(夏令时切换几乎总落在该边界上,
+ *       少数例外最迟一刻钟后收敛), 该线程在首次调用getCurrentMillisecond()等接口时启动——也就是
  *       只要用到本库的定时器或网络设施就会启动。若程序完全不使用这些设施, 偏移将保持
  *       进程启动时的取值
  * Note 1: the return value changes when the daylight saving time switches, callers
  *       must not cache it as if it were a constant
  * Note 2: this function only reads a cached value, it neither locks nor blocks. The offset is
- *       calibrated by the timestamp thread on quarter hour boundaries (a daylight saving switch
- *       always lands on one), and that thread starts on the first call to interfaces such as
+ *       calibrated on quarter hour boundaries (a daylight saving switch almost always lands on
+ *       one, the few exceptions converge within a quarter of an hour), and that thread starts on the first call to interfaces such as
  *       getCurrentMillisecond(), that is, as soon as the timer or network facilities of this
  *       library are used. A program using none of them keeps the offset taken at startup
  */
