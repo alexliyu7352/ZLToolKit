@@ -8,11 +8,15 @@
  * may be found in the AUTHORS file in the root of the source tree.
  */
 
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "Util/local_time.h"
 #include "Util/util.h"
@@ -134,6 +138,60 @@ static bool selfConsistent(const char *tz) {
 }
 #endif
 
+#ifndef _WIN32
+//并发下tm_zone不得为空。这条用例针对的是一个具体的教训：曾经把tm_zone直接指向tzname[]，
+//而glibc在每一次localtime_r()中都会改写该数组——先置NULL、算完再写回，全程持tzset_lock，
+//本库却是不持锁读的，于是并发下读到NULL的比例可高达五成。单线程用例完全覆盖不到它。
+//tm_zone must never be null under concurrency. This case guards a concrete lesson: tm_zone used
+//to point straight into tzname[], which glibc rewrites on every localtime_r() call, setting it
+//to NULL first and writing it back afterwards, all under tzset_lock while this library reads
+//without any lock; the share of NULL readings reached fifty percent. A single threaded case
+//cannot catch that at all.
+static bool zoneStableUnderConcurrency() {
+    //必须用读取时区数据库的时区名，不能用POSIX TZ字符串：glibc只有在走tzfile这条路径时
+    //才会反复改写tzname[]，用"CST-8"之类的字符串跑，这条用例会静默地什么都测不到
+    //A timezone name backed by the timezone database is required here, a POSIX TZ string will
+    //not do: glibc only rewrites tzname[] on the tzfile code path, so running this case with
+    //something like "CST-8" would silently exercise nothing
+    useTimezone("Asia/Shanghai");
+
+    std::atomic<bool> running { true };
+    std::atomic<uint64_t> calls { 0 }, nulls { 0 };
+    //持续触发localtime_r，模拟每60秒一次的校准、日志清理时的mktime以及宿主自身的时间调用
+    //Keep triggering localtime_r to mimic the periodic calibration, the mktime of the log
+    //cleanup and any time call the host program itself makes
+    std::thread refresher([&]() {
+        while (running) {
+            local_time_refresh();
+        }
+    });
+    std::vector<std::thread> readers;
+    for (int i = 0; i < 4; ++i) {
+        readers.emplace_back([&]() {
+            while (running) {
+                auto tm = getLocalTime(time(nullptr));
+                ++calls;
+                if (!tm.tm_zone) {
+                    ++nulls;
+                }
+            }
+        });
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    running = false;
+    refresher.join();
+    for (auto &t : readers) {
+        t.join();
+    }
+    if (nulls) {
+        printf("[FAIL] 并发下tm_zone读到空指针: %llu/%llu 次\n", (unsigned long long)nulls.load(),
+               (unsigned long long)calls.load());
+        return false;
+    }
+    return true;
+}
+#endif
+
 int main() {
     //记录原有TZ，测试结束后恢复
     //Remember the original TZ and restore it when the test is over
@@ -171,6 +229,12 @@ int main() {
         }
 #endif
     }
+
+#ifndef _WIN32
+    if (ret == 0 && !zoneStableUnderConcurrency()) {
+        ret = 3;
+    }
+#endif
 
     //恢复原有时区，避免影响同一进程内的后续代码
     //Restore the original timezone so that later code in the same process is unaffected

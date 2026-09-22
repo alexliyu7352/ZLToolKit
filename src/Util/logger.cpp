@@ -496,13 +496,17 @@ static time_t getLogFileTime(const string &full_path) {
     if (!strptime(name, "%Y-%m-%d", &tm)) {
         return 0;
     }
-    //tm_isdst保持0意味着强制按标准时解释该日期，夏令时期间的日志文件会因此偏差一小时，
-    //经getDay()换算后被算作前一天，最终比保留天数提前一天被删除；置-1交由mktime自行判断
-    //Leaving tm_isdst at zero forces the date to be read as standard time, which puts the log
-    //files of the daylight saving period one hour off, makes getDay() attribute them to the
-    //previous day and deletes them one day earlier than the retention setting; -1 lets mktime
-    //work it out on its own
-    tm.tm_isdst = -1;
+    //此处刻意保持tm_isdst为0(即按标准时解释该日期)，不要改成-1：
+    //getDay()一律用"当前时刻"的偏移去换算天序，只要这里取的偏移不大于当前偏移，天序就正确。
+    //标准时是该时区最小的偏移，恒满足该条件；而-1会取这一天真实的历史偏移，夏令时期间写的
+    //日志在冬天被清理时，偏移反而比当前大一小时，天序倒退一天，日志会被提前一天删除。
+    //Keep tm_isdst at zero on purpose, that is, read the date as standard time; do not change it
+    //to -1: getDay() always converts using the offset of the current moment, so the day number is
+    //right as long as the offset used here is not greater than the current one. Standard time is
+    //the smallest offset of a timezone and always satisfies that, whereas -1 picks the real
+    //historical offset of that day, which for logs written during the daylight saving period is
+    //one hour larger than the current offset when they are cleaned up in winter; the day number
+    //then goes back by one and the logs get deleted a day early.
     //此函数会把本地时间转换成GMT时间戳
     return mktime(&tm);
 }
@@ -555,12 +559,9 @@ void FileChannel::write(const Logger &logger, const LogContextPtr &ctx) {
             //重置日志index
             _index = 0;
         }
-        //夏令时结束会让本地日期回退，此时不能重置index，
-        //否则会以追加方式重新打开当天已有的第一个切片，使其超出单文件大小上限、切片时序错乱
-        //The local date goes backwards when the daylight saving time ends, the index
-        //must not be reset then, otherwise the first slice already written that day
-        //would be reopened in append mode, growing past the size limit and mixing up
-        //the chronological order of the slices
+        //系统时间被回拨等原因会让日期倒退，此时不重置index，避免退回到当天已有的切片上
+        //The date goes backwards when the system clock is set back, the index is not reset then
+        //so that an already existing slice of that day is not reused
         //这条日志是新的一天，记录这一天
         _last_day = day;
         //获取日志当天对应的文件，每天可能有多个日志切片文件
@@ -617,15 +618,7 @@ void FileChannel::checkSize(time_t second) {
 }
 
 void FileChannel::changeFile(time_t second) {
-    //夏令时结束会让本地日期回退到当天已经写过日志的时段，需要跳过已存在的切片，
-    //否则会以追加方式写入旧切片，使其超出单文件大小上限
-    //The local date goes backwards when the daylight saving time ends, landing on a
-    //day that already has slices; they must be skipped, otherwise an old slice would
-    //be written in append mode and grow past the size limit
-    string log_file;
-    do {
-        log_file = getLogFilePath(_dir, second, _index++);
-    } while (_log_file_map.count(log_file));
+    auto log_file = getLogFilePath(_dir, second, _index++);
     //记录所有的日志文件，以便后续删除老的日志
     _log_file_map.emplace(log_file);
     //打开新的日志文件

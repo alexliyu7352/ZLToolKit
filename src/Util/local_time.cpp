@@ -68,6 +68,17 @@ static std::atomic<int> _daylight_active { 0 };
  * Offset of the local time from UTC in seconds, taken from the tm_gmtoff of
  * localtime(), daylight saving time included */
 static std::atomic<long> _local_gmtoff { 0 };
+/* 时区缩写(如CST、EDT)，由local_time_refresh()从localtime()的结果中快照而来。
+ * 不能直接引用tzname[]：glibc在每一次localtime_r()中都会改写它——先置NULL、算完再写回，
+ * 全程由tzset_lock保护，而本文件是不持锁读的，并发下会读到NULL。
+ * localtime()返回的tm_zone指向glibc内部永久驻留的字符串，保存其指针是安全的。
+ * The timezone abbreviation (CST, EDT and so on), snapshotted by local_time_refresh() from the
+ * result of localtime(). Referring to tzname[] directly is not an option: glibc rewrites it on
+ * every single localtime_r() call, setting it to NULL first and writing it back afterwards, all
+ * of it under tzset_lock while this file reads without holding any lock, so a concurrent reader
+ * would observe NULL. The tm_zone returned by localtime() points into a string glibc keeps
+ * alive forever, so storing that pointer is safe. */
+static std::atomic<const char *> _local_zone { "UTC" };
 
 int get_daylight_active() {
     return _daylight_active.load(std::memory_order_relaxed);
@@ -111,12 +122,10 @@ void no_locks_localtime(struct tm *tmp, time_t t) {
     tmp->tm_sec = (seconds % secs_hour) % secs_min;
 #ifndef _WIN32
     tmp->tm_gmtoff = gmtoff;
-    /* tm_zone不填的话就是调用方栈上的未初始化指针，一旦用%Z格式化便会读到非法内存；
-     * tzname由tzset()填充，读取它无需加锁，fork之后同样有效，因此在这里是安全的
+    /* tm_zone不填的话就是调用方栈上的未初始化指针，一旦用%Z格式化便会读到非法内存
      * Leaving tm_zone alone would keep whatever uninitialized pointer the caller has on its
-     * stack, and formatting with %Z would then read invalid memory; tzname is filled in by
-     * tzset(), reading it needs no lock and stays valid across fork(), so it is safe here */
-    tmp->tm_zone = tzname[daylight_active ? 1 : 0];
+     * stack, and formatting with %Z would then read invalid memory */
+    tmp->tm_zone = (char *)_local_zone.load(std::memory_order_relaxed);
 #endif
     /* 1/1/1970 was a Thursday, that is, day 4 from the POV of the tm structure
      * where sunday = 0, so to calculate the day of the week we have to add 4
@@ -176,6 +185,9 @@ void local_time_refresh() {
 #else
     localtime_r(&t, &aux);
     _local_gmtoff.store(aux.tm_gmtoff, std::memory_order_relaxed);
+    if (aux.tm_zone) {
+        _local_zone.store(aux.tm_zone, std::memory_order_relaxed);
+    }
 #endif
     _daylight_active.store(aux.tm_isdst > 0 ? 1 : 0, std::memory_order_relaxed);
 }
