@@ -203,6 +203,16 @@ static bool zoneStableUnderConcurrency() {
 }
 #endif
 
+//本用例仅适用于非Windows平台：Windows上getGMTOff()取自GetTimeZoneInformation，
+//只认系统时区设置、不认TZ环境变量，改TZ并不会让它的返回值发生变化；而getLocalTime()
+//在Windows上直接调用CRT的localtime_s，根本不经过本库的校准机制。也就是说这条用例
+//想验证的东西在Windows上既无法触发、也不存在
+//This case applies to non Windows platforms only: on Windows getGMTOff() comes from
+//GetTimeZoneInformation, which honours the system timezone setting rather than the TZ
+//environment variable, so changing TZ does not move its return value at all; and getLocalTime()
+//there calls the CRT localtime_s directly, bypassing the calibration of this library entirely.
+//What this case means to verify can neither be triggered nor even exists on Windows
+#ifndef _WIN32
 //校准机制本身是否还有人在执行。上面的用例都通过useTimezone()直接调用
 //local_time_refresh()来更新偏移，因此即便整套校准逻辑被删光也照样通过——
 //而"夏令时切换后偏移不再更新"正是这条链路唯一的真实故障模式。此处改完时区后
@@ -248,6 +258,7 @@ static bool calibrationStillHappens() {
     }
     return true;
 }
+#endif
 
 int main() {
     //记录原有TZ，测试结束后恢复
@@ -292,9 +303,11 @@ int main() {
         ret = 3;
     }
 #endif
+#ifndef _WIN32
     if (ret == 0 && !calibrationStillHappens()) {
         ret = 4;
     }
+#endif
 
     //恢复原有时区，避免影响同一进程内的后续代码
     //Restore the original timezone so that later code in the same process is unaffected
