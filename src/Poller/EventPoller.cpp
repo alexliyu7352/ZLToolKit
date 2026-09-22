@@ -109,13 +109,32 @@ EventPoller::~EventPoller() {
     
 #if defined(HAS_EPOLL) || defined(HAS_KQUEUE)
     if (_event_fd != INVALID_EVENT_FD) {
-        close_event(_event_fd);
+        bool can_close = true;
+#if defined(_WIN32)
+        //轮询线程没能正常走出循环时就不关句柄:进程退出时Windows会先杀掉其余线程,被杀的线程
+        //在wepoll的epoll_wait里持有的引用永远不会释放,epoll_close于是死等(wepoll.c:1413)。
+        //注意该条件不止进程退出一种成因——运行期间管道写失败同样会落到这里,那就是真泄漏了,
+        //只是进程退出是目前唯一观察到的情形
+        //Do not close the handle when the polling thread failed to leave its loop: while a process
+        //exits Windows kills the other threads first, and the reference such a thread holds inside
+        //the epoll_wait of wepoll is never released, so epoll_close waits forever (wepoll.c:1413).
+        //Note this covers more than process exit: a failing pipe write at run time lands here too
+        //and the handle then really leaks; process exit is merely the only case observed so far
+        can_close = _exit_flag;
+#endif
+        if (can_close) {
+            close_event(_event_fd);
+        }
         _event_fd = INVALID_EVENT_FD;
     }
 #endif
 
     //退出前清理管道中的数据  [AUTO-TRANSLATED:60e26f9a]
     //Clean up pipe data before exiting
+    //已知残留风险:onPipeEvent会取_mtx_task,被系统杀死的轮询线程若恰好持有该锁,此处将永久
+    //阻塞。修它需要重构整个退出流程,本次未做
+    //Known residual risk: onPipeEvent takes _mtx_task, and if the polling thread killed by the
+    //system happened to hold it this blocks forever. Fixing it needs the whole teardown reworked
     onPipeEvent(true);
     InfoL << getThreadName();
 }
