@@ -104,11 +104,14 @@ void no_locks_localtime(struct tm *tmp, time_t t) {
     const time_t secs_hour = 3600;
     const time_t secs_day = 3600 * 24;
 
-    /* 偏移量只取一次快照，避免并发的local_time_refresh()导致
-     * 换算出的时刻与tm_gmtoff互相矛盾
-     * Take a single snapshot of the offset, so that a concurrent
-     * local_time_refresh() cannot make the broken down time and tm_gmtoff
-     * disagree with each other. */
+    /* 偏移量只取一次快照，使换算出的时刻与tm_gmtoff必定同源。
+     * 注意tm_isdst与tm_zone是另外两个独立的原子量，夏令时切换的那一瞬(纳秒级、一年两次)
+     * 三者未必互洽，可能出现"新偏移配旧的tm_isdst"，此时时刻本身仍是对的。
+     * Take a single snapshot of the offset so that the broken down time and tm_gmtoff always
+     * come from the same source. Note that tm_isdst and tm_zone are two further independent
+     * atomics: at the very instant of a switch (a matter of nanoseconds, twice a year) the three
+     * need not agree, a new offset may come with a stale tm_isdst, while the time itself stays
+     * correct. */
     int daylight_active = get_daylight_active();
     long gmtoff = get_local_gmtoff();
 
@@ -125,7 +128,7 @@ void no_locks_localtime(struct tm *tmp, time_t t) {
     /* tm_zone不填的话就是调用方栈上的未初始化指针，一旦用%Z格式化便会读到非法内存
      * Leaving tm_zone alone would keep whatever uninitialized pointer the caller has on its
      * stack, and formatting with %Z would then read invalid memory */
-    tmp->tm_zone = (char *)_local_zone.load(std::memory_order_relaxed);
+    tmp->tm_zone = (char *)_local_zone.load(std::memory_order_acquire);
 #endif
     /* 1/1/1970 was a Thursday, that is, day 4 from the POV of the tm structure
      * where sunday = 0, so to calculate the day of the week we have to add 4
@@ -186,7 +189,10 @@ void local_time_refresh() {
     localtime_r(&t, &aux);
     _local_gmtoff.store(aux.tm_gmtoff, std::memory_order_relaxed);
     if (aux.tm_zone) {
-        _local_zone.store(aux.tm_zone, std::memory_order_relaxed);
+        /* 与读侧的acquire配对：发布的是指针，读者随后要读它指向的字节
+         * Paired with the acquire on the reading side: what is published is a pointer whose
+         * bytes the reader goes on to read */
+        _local_zone.store(aux.tm_zone, std::memory_order_release);
     }
 #endif
     _daylight_active.store(aux.tm_isdst > 0 ? 1 : 0, std::memory_order_relaxed);

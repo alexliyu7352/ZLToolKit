@@ -39,8 +39,8 @@ static void useTimezone(const char *tz) {
     setenv("TZ", tz, 1);
     tzset();
 #endif
-    //绕开最长60秒的校准间隔，让改动立刻生效
-    //Bypass the calibration interval of up to 60 seconds so the change takes effect at once
+    //直接刷新，不等库自己按刻钟边界去发现
+    //Refresh right away instead of waiting for the library to notice on a quarter hour boundary
     local_time_refresh();
 }
 
@@ -154,10 +154,21 @@ static bool zoneStableUnderConcurrency() {
     //not do: glibc only rewrites tzname[] on the tzfile code path, so running this case with
     //something like "CST-8" would silently exercise nothing
     useTimezone("Asia/Shanghai");
+    //缺少时区数据库时(精简容器、交叉编译的根文件系统等)，glibc会把上面的名字当作POSIX
+    //TZ字符串解析失败后退回UTC，于是不再走tzfile那条会改写tzname[]的路径，这条用例就会
+    //静默地什么都测不到。此处显式断言环境可用，宁可失败也不要假绿。
+    //Without a timezone database (a slim container, a cross compiled rootfs and so on) glibc
+    //parses the name above as a POSIX TZ string, fails and falls back to UTC, no longer taking
+    //the tzfile path that rewrites tzname[], and this case would silently exercise nothing. The
+    //environment is asserted explicitly here: failing is better than being falsely green.
+    if (getGMTOff() != 8 * 3600) {
+        printf("[FAIL] 时区数据库不可用(Asia/Shanghai解析为偏移%ld)，并发用例无法生效\n", getGMTOff());
+        return false;
+    }
 
     std::atomic<bool> running { true };
     std::atomic<uint64_t> calls { 0 }, nulls { 0 };
-    //持续触发localtime_r，模拟每60秒一次的校准、日志清理时的mktime以及宿主自身的时间调用
+    //持续触发localtime_r，模拟按刻钟边界发生的校准、日志清理时的mktime以及宿主自身的时间调用
     //Keep triggering localtime_r to mimic the periodic calibration, the mktime of the log
     //cleanup and any time call the host program itself makes
     std::thread refresher([&]() {
@@ -191,6 +202,52 @@ static bool zoneStableUnderConcurrency() {
     return true;
 }
 #endif
+
+//校准机制本身是否还有人在执行。上面的用例都通过useTimezone()直接调用
+//local_time_refresh()来更新偏移，因此即便整套校准逻辑被删光也照样通过——
+//而"夏令时切换后偏移不再更新"正是这条链路唯一的真实故障模式。此处改完时区后
+//不手动刷新，只等库自己把偏移纠正过来。
+//Whether anything still performs the calibration. The cases above update the offset by calling
+//local_time_refresh() directly through useTimezone(), so they would pass even if the whole
+//calibration logic were deleted, while "the offset stops being updated after a switch" is the
+//one real failure mode of this path. Here the timezone is changed without refreshing by hand,
+//and the library is expected to correct the offset on its own.
+static bool calibrationStillHappens() {
+    //时间戳线程在岗时由它校准，不在岗时由调用方兜底，两种情形都应当收敛
+    //While the timestamp thread is on duty it calibrates, otherwise the caller does; the offset
+    //is expected to converge either way
+    for (int round = 0; round < 2; ++round) {
+        if (round == 1) {
+            getCurrentMillisecond();  //第二轮先把时间戳线程拉起来
+        }
+        useTimezone("UTC0");
+        const char *tz = "CST-8";
+#ifdef _WIN32
+        _putenv_s("TZ", tz);
+        _tzset();
+#else
+        setenv("TZ", tz, 1);
+        tzset();
+#endif
+        //改完时区后不再手动刷新，等库自己发现
+        //No manual refresh after changing the timezone, the library has to notice by itself
+        bool ok = false;
+        for (int i = 0; i < 400 && !ok; ++i) {
+            auto tm = getLocalTime(time(nullptr));
+            (void)tm;
+            ok = getGMTOff() == 8 * 3600;
+            if (!ok) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        }
+        if (!ok) {
+            printf("[FAIL] 改动时区后偏移始终未被校准(第%d轮, 时间戳线程%s): getGMTOff()=%ld\n", round + 1,
+                   round ? "在岗" : "不在岗", getGMTOff());
+            return false;
+        }
+    }
+    return true;
+}
 
 int main() {
     //记录原有TZ，测试结束后恢复
@@ -235,6 +292,9 @@ int main() {
         ret = 3;
     }
 #endif
+    if (ret == 0 && !calibrationStillHappens()) {
+        ret = 4;
+    }
 
     //恢复原有时区，避免影响同一进程内的后续代码
     //Restore the original timezone so that later code in the same process is unaffected

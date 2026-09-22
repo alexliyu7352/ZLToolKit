@@ -137,6 +137,13 @@ foreach(TEST_SRC ${TEST_SRC_LIST})
         #A single case finishes within seconds; time out instead of stalling the whole pipeline
         set_tests_properties(${TESTER} PROPERTIES TIMEOUT 120)
 
+        if(${TESTER} STREQUAL test_localTime)
+            #把时区校准的对齐粒度压到1秒，否则"校准是否仍在发生"这条用例要真的等上一刻钟
+            #Squeeze the alignment of the timezone calibration down to one second, otherwise the
+            #case checking that the calibration still happens would have to wait a whole quarter
+            set_tests_properties(${TESTER} PROPERTIES ENVIRONMENT "ZLTOOLKIT_GMTOFF_ALIGN=1")
+        endif()
+
     endif()
 endforeach()
 
