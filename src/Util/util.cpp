@@ -451,8 +451,10 @@ static long queryGMTOff() {
 //log for instance) would block forever. No pthread_atfork() guard is installed here
 //because that hook is process wide and a base library should not register one on behalf
 //of its users; programs that need it should guard their own fork() calls
-static void refreshGMTOff() {
-    auto quarter = ::time(nullptr) / s_gmtoff_align;
+//由时间戳线程调用，取本地时间的路径上一律只读缓存、不取锁
+//Called from the timestamp thread; the paths that fetch the local time only read the cache
+static void refreshGMTOff(time_t now) {
+    auto quarter = now / s_gmtoff_align;
     auto last = s_gmtoff_quarter.load(memory_order_relaxed);
     //仍处在同一刻钟之内，期间不可能发生夏令时切换，直接读缓存即可；
     //系统时间被回拨时刻钟序号同样会变化，因而一并覆盖
@@ -484,7 +486,6 @@ static onceToken s_token([]() {
 });
 
 long getGMTOff() {
-    refreshGMTOff();
 #ifdef _WIN32
     return s_gmtoff.load(memory_order_relaxed);
 #else
@@ -537,6 +538,19 @@ static inline bool initMillisecondThread() {
             } else if (expired != 0) {
                 WarnL << "Stamp expired is abnormal: " << expired;
             }
+
+            //顺带校准时区偏移。放在本线程而不是取本地时间的调用方线程里，是为了让
+            //getLocalTime()/getGMTOff()这两条日志热路径彻底不碰锁——本库是事件驱动的，
+            //事件循环线程上任何一次阻塞都值得避免。绝大多数时候这里只是一次time()与
+            //一次原子比较，只有跨过刻钟边界才会真正去取一次时区锁
+            //Calibrate the timezone offset here as well. It is done on this thread rather than on
+            //whichever thread asks for the local time, so that getLocalTime() and getGMTOff(),
+            //both on the logging hot path, never touch a lock: this is an event driven library and
+            //any block on an event loop thread is worth avoiding. Almost always this is just one
+            //time() call and one atomic comparison; the timezone lock is only taken when a quarter
+            //hour boundary has been crossed
+            refreshGMTOff(now / 1000000);
+
             //休眠0.5 ms  [AUTO-TRANSLATED:5e20acdd]
             //Sleep for 0.5 ms
             usleep(500);
@@ -590,10 +604,6 @@ struct tm getLocalTime(time_t sec) {
 #ifdef _WIN32
     localtime_s(&tm, &sec);
 #else
-    //校准夏令时状态，否则夏令时切换后本地时间会一直相差1小时
-    //Calibrate the daylight saving state, otherwise the local time would stay one
-    //hour off after a daylight saving time switch
-    refreshGMTOff();
     no_locks_localtime(&tm, sec);
 #endif //_WIN32
     return tm;

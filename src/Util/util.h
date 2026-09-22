@@ -325,19 +325,17 @@ const char *strcasestr(const char *big, const char *little);
  * [AUTO-TRANSLATED:43d2403a]
  *
  * 注意1: 返回值会随夏令时切换而变化, 调用方不能把它当成常量缓存
- * 注意2: 校准按一刻钟对齐(夏令时切换必然落在刻钟边界上), 跨过边界后的首次调用才会校准
- * 注意3(仅非Windows): 校准会调用localtime_r, glibc内部会加锁; 若程序在多线程状态下
- *       fork(), 且子进程继续取本地时间(例如打印日志), 则存在极小概率继承到一把不会被
- *       释放的锁而永久阻塞, 这类程序需自行用pthread_atfork()保护
+ * 注意2: 本函数只读缓存, 不加锁也不阻塞。偏移由时间戳线程按一刻钟边界校准(夏令时切换
+ *       必然落在该边界上), 该线程在首次调用getCurrentMillisecond()等接口时启动——也就是
+ *       只要用到本库的定时器或网络设施就会启动。若程序完全不使用这些设施, 偏移将保持
+ *       进程启动时的取值
  * Note 1: the return value changes when the daylight saving time switches, callers
  *       must not cache it as if it were a constant
- * Note 2: the calibration is aligned to a quarter of an hour (a daylight saving switch always
- *       lands on such a boundary) and happens on the first call after a boundary is crossed
- * Note 3 (non Windows only): the calibration calls localtime_r(), which takes a lock
- *       inside glibc; should the program fork() from a multi-threaded context and the
- *       child process keep getting the local time (printing logs for instance), there
- *       is a tiny chance for it to inherit a lock that is never released and block
- *       forever, such programs should guard it themselves with pthread_atfork()
+ * Note 2: this function only reads a cached value, it neither locks nor blocks. The offset is
+ *       calibrated by the timestamp thread on quarter hour boundaries (a daylight saving switch
+ *       always lands on one), and that thread starts on the first call to interfaces such as
+ *       getCurrentMillisecond(), that is, as soon as the timer or network facilities of this
+ *       library are used. A program using none of them keeps the offset taken at startup
  */
 long getGMTOff();
 
@@ -385,12 +383,13 @@ std::string getTimeStr(const char *fmt,time_t time = 0);
  *
  * 以下两点仅适用于非Windows平台(Windows直接调用localtime_s, 不受影响):
  * 注意1: 时区偏移按"当前时刻"取得并套用于所有时间戳, 查询非当前季节的时间戳会相差1小时
- * 注意2: 与getGMTOff()共用同一套校准机制, 其注意2、注意3同样适用
+ * 注意2: 本函数不加锁也不阻塞, 与getGMTOff()共用同一份由时间戳线程维护的偏移, 其注意2同样适用
  * The two points below apply to non Windows platforms only (Windows calls
  * localtime_s() directly and is not affected):
  * Note 1: the timezone offset reflects the current moment and is applied to every
  *       timestamp, so a timestamp belonging to another season is off by one hour
- * Note 2: it shares the calibration with getGMTOff(), whose notes 2 and 3 apply here
+ * Note 2: this function neither locks nor blocks; it shares the offset maintained by the
+ *       timestamp thread with getGMTOff(), whose note 2 applies here as well
  */
 struct tm getLocalTime(time_t sec);
 
