@@ -1,0 +1,56 @@
+# 临时调试用：定位 test_udpSocketBufferConfig 在 macOS 上进程退出阶段的段错误。
+# 定位完成后请删除本文件，不要合入。
+name: DebugMacOS
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: macOS-latest
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: 配置 vcpkg
+      uses: lukka/run-vcpkg@v7
+      with:
+        vcpkgDirectory: '${{github.workspace}}/vcpkg'
+        vcpkgTriplet: arm64-osx
+        vcpkgGitCommitId: 'efcfaaf60d7ec57a159fc3110403d939bfb69729'
+        vcpkgArguments: 'openssl'
+
+    - name: 安装指定 CMake
+      uses: jwlawson/actions-setup-cmake@v2
+      with:
+        cmake-version: '3.30.5'
+
+    - name: 编译
+      uses: lukka/run-cmake@v3
+      with:
+        useVcpkgToolchainFile: true
+        buildDirectory: '${{github.workspace}}/build'
+        cmakeAppendedArgs: ''
+        cmakeBuildType: 'RelWithDebInfo'
+
+    - name: 统计崩溃率并抓取崩溃栈
+      working-directory: '${{github.workspace}}/build'
+      run: |
+        set +e   # 用例必然非零退出,不能让 errexit 中断本步骤
+        BIN=$(find . -name test_udpSocketBufferConfig -type f -perm +111 | head -1)
+        echo "binary=$BIN"
+        fail=0
+        for i in $(seq 1 30); do
+          "$BIN" > /dev/null 2>&1; rc=$?
+          if [ $rc -ne 0 ]; then fail=$((fail+1)); echo "第 $i 次 退出码=$rc"; fi
+        done
+        echo "===== 裸跑 30 次，失败 $fail 次 ====="
+        echo "===== 系统崩溃报告 ====="
+        ls -t "$HOME/Library/Logs/DiagnosticReports/"*.ips 2>/dev/null | head -2 | while read f; do
+          echo "--- $f ---"; head -150 "$f"
+        done || true
+        echo "===== lldb 栈 ====="
+        for i in 1 2 3 4 5 6; do
+          echo "--- lldb 第 $i 次 ---"
+          lldb -b -o run -o "thread backtrace all" -o quit "$BIN" 2>&1 | tail -70
+        done
+        echo "===== 调试步骤结束 ====="
+        exit 0
