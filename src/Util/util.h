@@ -325,14 +325,14 @@ const char *strcasestr(const char *big, const char *little);
  * [AUTO-TRANSLATED:43d2403a]
  *
  * 注意1: 返回值会随夏令时切换而变化, 调用方不能把它当成常量缓存
- * 注意2: 该函数最多每60秒校准一次, 所以夏令时切换最迟在60秒后才会生效
+ * 注意2: 校准按一刻钟对齐(夏令时切换必然落在刻钟边界上), 跨过边界后的首次调用才会校准
  * 注意3(仅非Windows): 校准会调用localtime_r, glibc内部会加锁; 若程序在多线程状态下
  *       fork(), 且子进程继续取本地时间(例如打印日志), 则存在极小概率继承到一把不会被
  *       释放的锁而永久阻塞, 这类程序需自行用pthread_atfork()保护
  * Note 1: the return value changes when the daylight saving time switches, callers
  *       must not cache it as if it were a constant
- * Note 2: it is calibrated at most once every 60 seconds, so a daylight saving time
- *       switch takes up to 60 seconds to be picked up
+ * Note 2: the calibration is aligned to a quarter of an hour (a daylight saving switch always
+ *       lands on such a boundary) and happens on the first call after a boundary is crossed
  * Note 3 (non Windows only): the calibration calls localtime_r(), which takes a lock
  *       inside glibc; should the program fork() from a multi-threaded context and the
  *       child process keep getting the local time (printing logs for instance), there
