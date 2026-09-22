@@ -47,6 +47,7 @@ endif()
 set(GATING_TESTS
     test_creator
     test_ini
+    test_localTime
     test_logger
     test_resourcePool
     test_threadPool
