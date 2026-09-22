@@ -34,6 +34,7 @@ jobs:
     - name: 统计崩溃率并抓取崩溃栈
       working-directory: '${{github.workspace}}/build'
       run: |
+        set +e   # 用例必然非零退出,不能让 errexit 中断本步骤
         BIN=$(find . -name test_udpSocketBufferConfig -type f -perm +111 | head -1)
         echo "binary=$BIN"
         fail=0
@@ -50,4 +51,6 @@ jobs:
         for i in 1 2 3 4 5 6; do
           echo "--- lldb 第 $i 次 ---"
           lldb -b -o run -o "thread backtrace all" -o quit "$BIN" 2>&1 | tail -70
-        done || true
+        done
+        echo "===== 调试步骤结束 ====="
+        exit 0
