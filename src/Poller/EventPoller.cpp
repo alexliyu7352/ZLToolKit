@@ -110,6 +110,7 @@ void EventPoller::shutdown() {
 
 EventPoller::~EventPoller() {
     shutdown();
+    ::fprintf(stderr, "[DIAG] dtor: after shutdown\n"); ::fflush(stderr);
     
 #if defined(HAS_EPOLL) || defined(HAS_KQUEUE)
     if (_event_fd != INVALID_EVENT_FD) {
@@ -117,11 +118,14 @@ EventPoller::~EventPoller() {
         _event_fd = INVALID_EVENT_FD;
     }
 #endif
+    ::fprintf(stderr, "[DIAG] dtor: after close_event\n"); ::fflush(stderr);
 
     //退出前清理管道中的数据  [AUTO-TRANSLATED:60e26f9a]
     //Clean up pipe data before exiting
     onPipeEvent(true);
+    ::fprintf(stderr, "[DIAG] dtor: after onPipeEvent\n"); ::fflush(stderr);
     InfoL << getThreadName();
+    ::fprintf(stderr, "[DIAG] dtor: after InfoL\n"); ::fflush(stderr);
 }
 
 int EventPoller::addEvent(int fd, int event, PollEventCB cb) {
