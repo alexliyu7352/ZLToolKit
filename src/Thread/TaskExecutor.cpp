@@ -227,6 +227,24 @@ size_t TaskExecutorGetterImp::getExecutorSize() const {
     return _threads.size();
 }
 
+TaskExecutorGetterImp::~TaskExecutorGetterImp() {
+    //先在本线程逐个停掉轮询线程,再释放引用。否则队列里残留的任务(例如Socket析构)会在轮询
+    //线程上执行,并在那里释放掉poller的最后一个引用,对象于是死在自己的线程里,任务返回到
+    //runLoop的循环条件时便读到了已释放的内存。
+    //放在本基类而不是某个具体的池子里,是因为_threads归本类所有:EventPollerPool与
+    //WorkThreadPool都经addPoller()把EventPoller放进来,两者需要的是同一份收尾逻辑
+    //Stop each polling thread from this thread before releasing the references. Otherwise a task
+    //left in the queue (the destruction of a Socket for instance) runs on the polling thread and
+    //drops the last reference to the poller there, so the object dies on its own thread and the
+    //task returns into a loop condition of runLoop that reads freed memory.
+    //This belongs to the base class rather than to one particular pool because _threads is owned
+    //here: both EventPollerPool and WorkThreadPool fill it with EventPoller through addPoller(),
+    //so both need the very same teardown
+    for (auto &th : _threads) {
+        static_pointer_cast<EventPoller>(th)->shutdown();
+    }
+}
+
 size_t TaskExecutorGetterImp::addPoller(const string &name, size_t size, int priority, bool register_thread, bool enable_cpu_affinity) {
     auto cpus = thread::hardware_concurrency();
     size = size > 0 ? size : cpus;
