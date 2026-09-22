@@ -628,6 +628,19 @@ void EventPollerPool::preferCurrentThread(bool flag) {
 
 const std::string EventPollerPool::kOnStarted = "kBroadcastEventPollerPoolStarted";
 
+EventPollerPool::~EventPollerPool() {
+    //先在本线程逐个停掉轮询线程,再释放引用。否则队列里残留的任务(例如Socket析构)会在
+    //轮询线程上执行,并在那里释放掉poller的最后一个引用,对象于是死在自己的线程里,
+    //任务返回到循环条件时便读到了已释放的内存
+    //Stop each polling thread from this thread before releasing the references. Otherwise a task
+    //left in the queue (the destruction of a Socket for instance) runs on the polling thread and
+    //drops the last reference to the poller there, so the object dies on its own thread and the
+    //task returns into a loop condition that reads freed memory
+    for (auto &th : _threads) {
+        static_pointer_cast<EventPoller>(th)->shutdown();
+    }
+}
+
 EventPollerPool::EventPollerPool() {
     auto size = addPoller("event poller", s_pool_size, ThreadPool::PRIORITY_HIGHEST, true, s_enable_cpu_affinity);
     NOTICE_EMIT(EventPollerPoolOnStartedArgs, kOnStarted, *this, size);

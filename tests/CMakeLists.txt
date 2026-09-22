@@ -63,11 +63,10 @@ set(GATING_TESTS
 #test_ringBuffer likewise stops after its event callbacks. This is a pre-existing problem of
 #ZLToolKit on Windows (the event polling threads fail to finish while the process exits),
 #unrelated to the gate itself; they will join the Windows whitelist once it is fixed.
-if(NOT WIN32)
-    list(APPEND GATING_TESTS
-         test_ringBuffer
-         test_udpSocketBufferConfig)
-endif()
+#临时验证:连同Windows一并收录,确认上面那个退出期缺陷修掉后是否不再卡住
+list(APPEND GATING_TESTS
+     test_ringBuffer
+     test_udpSocketBufferConfig)
 
 foreach(TEST_SRC ${TEST_SRC_LIST})
     STRING(REGEX REPLACE "^\\./|\\.c[a-zA-Z0-9_]*$" "" TESTER ${TEST_SRC})

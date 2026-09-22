@@ -47,6 +47,7 @@ constexpr epoll_fd INVALID_EVENT_FD = -1;
 namespace toolkit {
 
 class EventPoller : public TaskExecutor, public AnyStorage, public std::enable_shared_from_this<EventPoller> {
+    friend class EventPollerPool;
 public:
     friend class TaskExecutorGetterImp;
 
@@ -347,7 +348,7 @@ public:
     static const std::string kOnStarted;
 #define EventPollerPoolOnStartedArgs EventPollerPool &pool, size_t &size
 
-    ~EventPollerPool() = default;
+    ~EventPollerPool() override;
 
     /**
      * 获取单例
