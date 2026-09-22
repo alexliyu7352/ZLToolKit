@@ -91,14 +91,18 @@ EventPoller::EventPoller(std::string name) {
 }
 
 void EventPoller::shutdown() {
+    ::fprintf(stderr, "[DIAG] shutdown enter\n"); ::fflush(stderr);
     async_l([]() {
         throw ExitException();
     }, false, true);
+    ::fprintf(stderr, "[DIAG] exit task posted\n"); ::fflush(stderr);
 
     if (_loop_thread) {
+        ::fprintf(stderr, "[DIAG] joining loop thread\n"); ::fflush(stderr);
         //防止作为子进程时崩溃  [AUTO-TRANSLATED:68727e34]
         //Prevent crash when running as a child process
         try { _loop_thread->join(); } catch (...) { _loop_thread->detach(); }
+        ::fprintf(stderr, "[DIAG] loop thread joined\n"); ::fflush(stderr);
         delete _loop_thread;
         _loop_thread = nullptr;
     }
@@ -293,7 +297,10 @@ Task::Ptr EventPoller::async_l(TaskIn task, bool may_sync, bool first) {
     }
     //写数据到管道,唤醒主线程  [AUTO-TRANSLATED:2ead8182]
     //Write data to the pipe and wake up the main thread
-    _pipe.write("", 1);
+    {
+        auto wret = _pipe.write("", 1);
+        ::fprintf(stderr, "[DIAG] pipe.write ret=%d\n", (int)wret); ::fflush(stderr);
+    }
     return ret;
 }
 
@@ -333,6 +340,7 @@ inline void EventPoller::onPipeEvent(bool flush) {
         try {
             (*task)();
         } catch (ExitException &) {
+            ::fprintf(stderr, "[DIAG] ExitException received\n"); ::fflush(stderr);
             _exit_flag = true;
         } catch (std::exception &ex) {
             ErrorL << "Exception occurred when do async task: " << ex.what();
@@ -534,6 +542,7 @@ void EventPoller::runLoop(bool blocked, bool ref_self) {
             callback_list.clear();
         }
 #endif //HAS_EPOLL
+        ::fprintf(stderr, "[DIAG] runLoop exited\n"); ::fflush(stderr);
     } else {
         _loop_thread = new thread(&EventPoller::runLoop, this, true, ref_self);
         _sem_run_started.wait();
